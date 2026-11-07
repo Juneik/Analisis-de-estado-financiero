@@ -1,0 +1,6 @@
+python 3.12.14
+numpy 2.5.4
+pandas 3.1.1
+matplotlib 3.11.2
+plataforma Windows-11-10.0.26200-SP0
+hmmlearn no se usa: el HMM, Forward y Viterbi están implementados en este archivo.

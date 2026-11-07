@@ -10,10 +10,14 @@ Pensado para ejecutarse en Google Colab o en local:
 Cambia SEMILLA_PRINCIPAL para obtener otro escenario.
 """
 
+import json
+import platform
+import sys
 from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 import numpy as np
 import pandas as pd
 
@@ -42,9 +46,20 @@ PI = np.array([0.4, 0.3, 0.3])
 
 PRECIO_INICIAL = 100.0
 N_PERIODOS = 50
+N_PERIODOS_EXTENDIDO = 100
+N_REPLICAS = 200
 SEMILLA_PRINCIPAL = 42
 SEMILLAS_COMPARACION = [7, 21, 42, 99, 2026]
 N_VALIDACION = 4000
+DPI = 300
+
+# Alta persistencia: la diagonal pasa a 0.80 y el 0.20 restante conserva
+# la proporción de las salidas de la matriz original.
+A_ALTA_PERSISTENCIA = np.array([
+    [0.80, 0.15, 0.05],
+    [0.10, 0.80, 0.10],
+    [0.05, 0.15, 0.80],
+])
 
 COLORES_REGIMEN = ["#1e8f4e", "#e6b325", "#d64545"]
 COLORES_OBS = ["#1e8f4e", "#7f8c8d", "#d64545"]
@@ -144,6 +159,19 @@ class HMMMercado:
         for t in range(tiempo - 2, -1, -1):
             camino[t] = psi[t + 1, camino[t + 1]]
         return camino
+
+    def log_verosimilitud(self, obs):
+        """Log P(O|λ) con el algoritmo Forward en escala logarítmica."""
+        n = len(self.estados)
+        log_a = np.log(self.A)
+        log_b = np.log(self.B)
+        alpha = np.log(self.pi) + log_b[:, obs[0]]
+        for t in range(1, len(obs)):
+            nuevo = np.empty(n)
+            for j in range(n):
+                nuevo[j] = np.logaddexp.reduce(alpha + log_a[:, j]) + log_b[j, obs[t]]
+            alpha = nuevo
+        return float(np.logaddexp.reduce(alpha))
 
     def distribucion_estacionaria(self):
         """Resuelve π = π A con la restricción de que las probabilidades sumen 1."""
@@ -304,7 +332,7 @@ def graficar_precio(estados, precios, ruta):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
-    fig.savefig(ruta, dpi=150, bbox_inches="tight")
+    fig.savefig(ruta, dpi=DPI, bbox_inches="tight")
     _cerrar(fig)
 
 
@@ -329,7 +357,7 @@ def graficar_retornos(obs, retornos, ruta):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
-    fig.savefig(ruta, dpi=150, bbox_inches="tight")
+    fig.savefig(ruta, dpi=DPI, bbox_inches="tight")
     _cerrar(fig)
 
 
@@ -345,7 +373,7 @@ def graficar_comparacion(filas, ruta):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     fig.tight_layout()
-    fig.savefig(ruta, dpi=150, bbox_inches="tight")
+    fig.savefig(ruta, dpi=DPI, bbox_inches="tight")
     _cerrar(fig)
 
 
@@ -427,6 +455,226 @@ def imprimir_escenario(datos):
     print(riesgo)
 
 
+def resumir_muestra(valores):
+    """Media, desviación estándar muestral, mínimo, máximo e IC del 95%."""
+    muestra = np.asarray(valores, dtype=float)
+    media = float(muestra.mean())
+    desv = float(muestra.std(ddof=1))
+    margen = 1.96 * desv / np.sqrt(len(muestra))
+    return {
+        "media": media,
+        "desv": desv,
+        "minimo": float(muestra.min()),
+        "maximo": float(muestra.max()),
+        "ic_bajo": media - margen,
+        "ic_alto": media + margen,
+        "n": int(len(muestra)),
+    }
+
+
+def definicion_escenarios():
+    return [
+        {
+            "codigo": "E1",
+            "nombre": "Línea base",
+            "descripcion": "Parámetros del enunciado",
+            "periodos": N_PERIODOS,
+            "transicion": A,
+        },
+        {
+            "codigo": "E2",
+            "nombre": "Alta persistencia",
+            "descripcion": "Diagonales de A en 0.80; las salidas conservan su proporción",
+            "periodos": N_PERIODOS,
+            "transicion": A_ALTA_PERSISTENCIA,
+        },
+        {
+            "codigo": "E3",
+            "nombre": "Horizonte extendido",
+            "descripcion": "Parámetros base con el doble de períodos",
+            "periodos": N_PERIODOS_EXTENDIDO,
+            "transicion": A,
+        },
+    ]
+
+
+def monte_carlo(n_replicas=N_REPLICAS):
+    """Corre las semillas 1..n en cada escenario y resume las métricas."""
+    metricas = (
+        "retorno_total",
+        "drawdown_maximo",
+        "n_cambios",
+        "acierto_viterbi",
+        "log_verosimilitud",
+    )
+    replicas = []
+    resumen = []
+    for escenario in definicion_escenarios():
+        modelo = HMMMercado(
+            ESTADOS, OBSERVACIONES, escenario["transicion"], B, PI
+        )
+        columnas = {nombre: [] for nombre in metricas}
+        for semilla in range(1, n_replicas + 1):
+            datos = correr_escenario(modelo, escenario["periodos"], semilla)
+            log_p = modelo.log_verosimilitud(datos["obs"])
+            fila = {
+                "escenario": escenario["codigo"],
+                "nombre": escenario["nombre"],
+                "semilla": semilla,
+                "periodos": escenario["periodos"],
+                "retorno_total": datos["retorno_total"],
+                "drawdown_maximo": datos["drawdown_maximo"],
+                "n_cambios": datos["n_cambios"],
+                "acierto_viterbi": datos["acierto_viterbi"],
+                "log_verosimilitud": log_p,
+                "precio_final": datos["precio_final"],
+            }
+            replicas.append(fila)
+            for nombre in metricas:
+                columnas[nombre].append(fila[nombre])
+        resumen.append({
+            "codigo": escenario["codigo"],
+            "nombre": escenario["nombre"],
+            "descripcion": escenario["descripcion"],
+            "periodos": escenario["periodos"],
+            "metricas": {nombre: resumir_muestra(columnas[nombre]) for nombre in metricas},
+        })
+    return replicas, resumen
+
+
+def graficar_monte_carlo(resumen, ruta):
+    paneles = [
+        ("retorno_total", "Retorno acumulado medio", True),
+        ("drawdown_maximo", "Drawdown máximo medio", True),
+        ("n_cambios", "Cambios de régimen medios", False),
+        ("acierto_viterbi", "Acierto medio de Viterbi", True),
+    ]
+    fig, ejes = plt.subplots(2, 2, figsize=(10.5, 7.2))
+    nombres = [item["codigo"] for item in resumen]
+    for ax, (clave, titulo, es_proporcion) in zip(ejes.ravel(), paneles):
+        medias = [item["metricas"][clave]["media"] for item in resumen]
+        bajos = [item["metricas"][clave]["ic_bajo"] for item in resumen]
+        altos = [item["metricas"][clave]["ic_alto"] for item in resumen]
+        if es_proporcion:
+            medias = [100 * valor for valor in medias]
+            bajos = [100 * valor for valor in bajos]
+            altos = [100 * valor for valor in altos]
+            ylabel = "Porcentaje"
+        else:
+            ylabel = "Cantidad de cambios"
+        yerr = np.vstack([
+            np.array(medias) - np.array(bajos),
+            np.array(altos) - np.array(medias),
+        ])
+        ax.bar(nombres, medias, color=["#1F4E79", "#5B8FA8", "#C4A35A"], width=0.62)
+        ax.errorbar(nombres, medias, yerr=yerr, fmt="none", ecolor="#1c1c1c", capsize=4, lw=1)
+        ax.axhline(0, color="#888888", lw=0.6)
+        ax.set_title(titulo)
+        ax.set_ylabel(ylabel)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=DPI, bbox_inches="tight")
+    _cerrar(fig)
+
+
+def diagrama_flujo(ruta):
+    pasos = [
+        "Fijar semilla, horizonte y parámetros π, A, B",
+        "Sortear el régimen inicial con la categórica π",
+        "Sortear la observación con la fila de B",
+        "Sortear la magnitud con la uniforme del par (estado, observación)",
+        "Actualizar el precio: P(t) = P(t-1) · (1 + r)",
+        "Si quedan períodos, transitar con la fila de A y volver",
+        "Decodificar con Viterbi y evaluar P(O|λ) con Forward",
+        "Calcular métricas y repetir el escenario con otra semilla",
+    ]
+    fig, ax = plt.subplots(figsize=(8.2, 10.4))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, len(pasos) + 1)
+    ax.axis("off")
+    for indice, texto in enumerate(pasos):
+        y = len(pasos) - indice
+        caja = FancyBboxPatch(
+            (0.7, y - 0.38), 8.6, 0.76,
+            boxstyle="round,pad=0.08,rounding_size=0.08",
+            facecolor="#E8F0F7" if indice not in (0, len(pasos) - 1) else "#1F4E79",
+            edgecolor="#1F4E79",
+            lw=1.1,
+        )
+        ax.add_patch(caja)
+        ax.text(
+            5, y, texto, ha="center", va="center", fontsize=9,
+            color="white" if indice in (0, len(pasos) - 1) else "#1c1c1c",
+        )
+        if indice < len(pasos) - 1:
+            ax.add_patch(FancyArrowPatch(
+                (5, y - 0.42), (5, y - 0.62),
+                arrowstyle="-|>", mutation_scale=12, color="#1F4E79", lw=1.1,
+            ))
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=DPI, bbox_inches="tight")
+    _cerrar(fig)
+
+
+def imprimir_monte_carlo(resumen):
+    print()
+    print("=" * 72)
+    print(f"MONTE CARLO  |  {N_REPLICAS} réplicas  |  semillas 1 a {N_REPLICAS}")
+    print("=" * 72)
+    for escenario in resumen:
+        print(f"\n{escenario['codigo']} — {escenario['nombre']} ({escenario['periodos']} períodos)")
+        print(f"{'Métrica':<22} {'Media':>10} {'Desv.':>10} {'Mín':>10} {'Máx':>10} {'IC 95%':>22}")
+        for nombre, etiqueta, como_pct in (
+            ("retorno_total", "Retorno acumulado", True),
+            ("drawdown_maximo", "Drawdown máximo", True),
+            ("n_cambios", "Cambios de régimen", False),
+            ("acierto_viterbi", "Acierto Viterbi", True),
+            ("log_verosimilitud", "Log-verosimilitud", False),
+        ):
+            stats = escenario["metricas"][nombre]
+            if como_pct:
+                texto = (
+                    f"{etiqueta:<22} {stats['media']:>10.2%} {stats['desv']:>10.2%} "
+                    f"{stats['minimo']:>10.2%} {stats['maximo']:>10.2%} "
+                    f"[{stats['ic_bajo']:.2%}, {stats['ic_alto']:.2%}]"
+                )
+            else:
+                texto = (
+                    f"{etiqueta:<22} {stats['media']:>10.2f} {stats['desv']:>10.2f} "
+                    f"{stats['minimo']:>10.2f} {stats['maximo']:>10.2f} "
+                    f"[{stats['ic_bajo']:.2f}, {stats['ic_alto']:.2f}]"
+                )
+            print(texto)
+
+
+def guardar_monte_carlo(replicas, resumen, datos_dir):
+    frame = pd.DataFrame(replicas)
+    frame.to_csv(datos_dir / "replicas_monte_carlo.csv", index=False, encoding="utf-8-sig")
+    with (datos_dir / "resumen_monte_carlo.json").open("w", encoding="utf-8") as archivo:
+        json.dump(resumen, archivo, ensure_ascii=False, indent=2)
+    try:
+        frame.to_excel(datos_dir / "replicas_monte_carlo.xlsx", index=False)
+    except ImportError:
+        print("openpyxl no está instalado: el detalle quedó en CSV.")
+    return frame
+
+
+def guardar_entorno(ruta):
+    lineas = [
+        f"python {sys.version.split()[0]}",
+        f"numpy {np.__version__}",
+        f"pandas {pd.__version__}",
+        f"matplotlib {matplotlib.__version__}",
+        f"plataforma {platform.platform()}",
+        "hmmlearn no se usa: el HMM, Forward y Viterbi están implementados en este archivo.",
+    ]
+    ruta.write_text("\n".join(lineas) + "\n", encoding="utf-8")
+    print()
+    print("Entorno:")
+    print("\n".join(lineas))
+
+
 def guardar_tabla(datos, ruta):
     frame = pd.DataFrame({
         "periodo": np.arange(1, N_PERIODOS + 1),
@@ -463,10 +711,13 @@ def main():
         print(f"  {nombre}: {validacion['frec_estados'][i]:.3f}")
 
     principal = correr_escenario(modelo, N_PERIODOS, SEMILLA_PRINCIPAL)
+    principal["log_verosimilitud"] = modelo.log_verosimilitud(principal["obs"])
     imprimir_escenario(principal)
+    print(f"Log-verosimilitud Forward: {principal['log_verosimilitud']:.2f}")
     graficar_precio(principal["estados"], principal["precios"], figuras / "precio_regimenes.png")
     graficar_retornos(principal["obs"], principal["retornos"], figuras / "retornos_observados.png")
     guardar_tabla(principal, datos_dir / "escenario_principal.csv")
+    diagrama_flujo(figuras / "diagrama_flujo.png")
 
     comparacion = [correr_escenario(modelo, N_PERIODOS, semilla) for semilla in SEMILLAS_COMPARACION]
     print()
@@ -479,6 +730,18 @@ def main():
         )
     graficar_comparacion(comparacion, figuras / "comparacion_escenarios.png")
 
+    replicas, resumen = monte_carlo()
+    imprimir_monte_carlo(resumen)
+    guardar_monte_carlo(replicas, resumen, datos_dir)
+    graficar_monte_carlo(resumen, figuras / "comparacion_monte_carlo.png")
+    replica_42 = next(
+        fila for fila in replicas
+        if fila["escenario"] == "E1" and fila["semilla"] == SEMILLA_PRINCIPAL
+    )
+    if not np.isclose(replica_42["retorno_total"], principal["retorno_total"]):
+        raise RuntimeError("La réplica E1 con semilla 42 no coincide con el escenario principal.")
+    guardar_entorno(datos_dir / "entorno.txt")
+
     return {
         "modelo": modelo,
         "estacionaria": estacionaria,
@@ -486,6 +749,8 @@ def main():
         "validacion": validacion,
         "principal": principal,
         "comparacion": comparacion,
+        "replicas": replicas,
+        "resumen": resumen,
     }
 
 
